@@ -1,0 +1,9 @@
+uom_code;uom_name;base_uom;factor_to_base
+PCS;шт;PCS;1.0
+PACK6;уп/6;PCS;6.0
+PACK12;уп/12;PCS;12.0
+PACK24;уп/24;PCS;24.0
+KG;кг;KG;1.0
+TON;т;KG;1000.0
+M;м;M;1.0
+ROLL50;бухта/50м;M;50.0
