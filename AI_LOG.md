@@ -1,6 +1,7 @@
 # Основные инструменты:
-Claude Code
-Model: Opus 5
+- Claude Code (для прикладной работы)
+    - Model: Opus 5
+- ChatGPT (для вспомогательной работы)
 
 ## Skills:
 
