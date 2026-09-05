@@ -1,0 +1,104 @@
+%% Полная схема пайплайна закупочной аналитики
+%% Статус читается ИЗ ТЕКСТА узлов и типа стрелки, а не из цвета:
+%%   [СЕЙЧАС]   релиз 1, недели 1-4      -- толстая стрелка  ==>
+%%   [ЭТАП 2]   недели 5-8               -- обычная стрелка  -->
+%%   [ПОЗЖЕ]    за горизонтом 8 недель   -- пунктир          -.->
+flowchart LR
+
+    subgraph SRC["1. ИСТОЧНИКИ"]
+        direction TB
+        S1["1С:УТ<br/>реплика PostgreSQL, чтение<br/><b>[СЕЙЧАС]</b>"]
+        S2["WMS<br/>Kafka wms.receipts.v1<br/>as-is формат<br/><b>[ЭТАП 2]</b>"]
+        S3["SRM REST API<br/>contracts / tenders / lots<br/>OAuth2, 100 req/min<br/><b>[ПОЗЖЕ]</b>"]
+    end
+
+    subgraph ING["2. INGESTION / LANDING"]
+        direction TB
+        I1["Батч-выгрузка из реплики<br/>ночное окно<br/><b>[СЕЙЧАС]</b>"]
+        I2["Kafka consumer<br/>непрерывно, at-least-once<br/>фиксация offset после COMMIT<br/><b>[ЭТАП 2]</b>"]
+        I3["API worker pool 2-4<br/>общий token bucket 90/мин<br/>очередь srm_fetch_queue<br/><b>[ПОЗЖЕ]</b>"]
+    end
+
+    subgraph RAW["3. RAW - неизменяемый след источника"]
+        direction TB
+        R1["raw.* таблицы 1С<br/>как есть<br/><b>[СЕЙЧАС]</b>"]
+        R2["raw.wms_receipt_event<br/>payload jsonb + координаты Kafka<br/><b>[ЭТАП 2]</b>"]
+        R3["raw.srm_*<br/>payload jsonb + scan_id<br/>хранится вечно<br/><b>[ПОЗЖЕ]</b>"]
+    end
+
+    subgraph STG["4. STAGING - типизация и стандартизация"]
+        direction TB
+        T1["Приведение типов<br/>объявление часовых зон<br/>MSK и UTC<br/><b>[СЕЙЧАС]</b>"]
+        T2["Адаптер as-is события<br/>v1 -> целевая форма<br/><b>[ЭТАП 2]</b>"]
+    end
+
+    subgraph DQ1["5. DATA QUALITY - шлюз"]
+        direction TB
+        Q1["Schema validation<br/>обязательность, домены"]
+        Q2["Quarantine<br/>непригодное не идёт дальше<br/>и не теряется"]
+        Q3["dq.run_metric<br/>пороги: block / warn / info"]
+    end
+
+    subgraph ODS["6. ODS - историчность и версии"]
+        direction TB
+        O1["ods.po_line_version<br/>все версии строк заказа<br/>одна действующая<br/><b>[СЕЙЧАС]</b>"]
+        O2["MDM поставщиков<br/>золотая запись по ИНН<br/>ручное подтверждение<br/><b>[СЕЙЧАС]</b>"]
+        O3["ods.srm_tender_state<br/>снимок payload_hash<br/>инкремент без updatedFrom<br/><b>[ПОЗЖЕ]</b>"]
+    end
+
+    subgraph DDS["7. CORE - целевая модель, звезда (Блок 2)"]
+        direction TB
+        D1["dds.fact_po_line<br/>зерно: действующая строка заказа<br/><b>[СЕЙЧАС]</b>"]
+        D2["dim_supplier SCD2 · dim_supplier_golden<br/>dim_item · dim_uom · dim_date<br/>ref_fx_rate_daily<br/><b>[СЕЙЧАС]</b>"]
+        D3["dds.fact_receipt<br/>зерно: одно событие приёмки<br/>append-only<br/><b>[ЭТАП 2]</b>"]
+        D4["dim_contract · fact_tender_lot<br/>+ contract_price в fact_po_line<br/>зерно факта НЕ меняется<br/><b>[ПОЗЖЕ]</b>"]
+    end
+
+    subgraph MART["8. MARTS - витрины"]
+        direction TB
+        M1["mart.spend_monthly<br/>оборот<br/><b>[СЕЙЧАС]</b>"]
+        M2["mart.price_benchmark<br/>сравнение цен<br/><b>[СЕЙЧАС]</b>"]
+        M3["mart.price_dynamics_quarter<br/>где выросло за квартал<br/><b>[СЕЙЧАС]</b>"]
+        M4["mart.otif_line + рейтинг поставщиков<br/><b>[ЭТАП 2]</b>"]
+    end
+
+    subgraph PUB["9. ПУБЛИКАЦИЯ И ВИДИМОСТЬ"]
+        direction TB
+        P1["Атомарная подмена схемы<br/>mart_build -> mart<br/>частичной публикации не бывает"]
+        P2["dq.mart_freshness<br/>data_as_of · published_at · status"]
+        P3["Дашборды<br/>индикатор свежести в шапке<br/>Q1 · Q2 · Q3 из Блока 3"]
+    end
+
+    S1 ==> I1 ==> R1 ==> T1
+    S2 --> I2 --> R2 --> T2
+    S3 -.-> I3 -.-> R3 -.-> T1
+
+    T1 ==> Q1
+    T2 --> Q1
+    Q1 --> Q2
+    Q1 --> Q3
+
+    Q1 ==> O1
+    Q1 ==> O2
+    Q1 -.-> O3
+
+    O1 ==> D1
+    O2 ==> D2
+    T2 --> D3
+    O3 -.-> D4
+
+    D1 ==> M1
+    D1 ==> M2
+    D1 ==> M3
+    D2 ==> M1
+    D1 --> M4
+    D3 --> M4
+    D4 -.-> M2
+
+    M1 ==> P1
+    M2 ==> P1
+    M3 ==> P1
+    M4 --> P1
+    P1 ==> P2 ==> P3
+
+    LEGEND["ЛЕГЕНДА<br/>Толстая двойная линия: релиз 1, недели 1-4<br/>Обычная сплошная линия: этап 2, недели 5-8<br/>Пунктирная линия: за горизонтом 8 недель<br/>Статус продублирован текстом в каждом узле,<br/>поэтому схема читается и без различения линий"]
