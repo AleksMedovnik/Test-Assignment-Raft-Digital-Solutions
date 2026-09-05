@@ -1,0 +1,101 @@
+%% Целевая аналитическая модель закупок — первый релиз (звезда)
+%% fact_receipt показан пунктиром: этап 2, в DDL первого релиза не входит
+erDiagram
+    dim_supplier_golden ||--|{ dim_supplier      : "золотая запись объединяет supplier_id по ИНН"
+    dim_supplier        ||--o{ fact_po_line      : "версия, действующая на дату заказа"
+    dim_item            ||--o{ fact_po_line      : "позиция, включая late-arriving"
+    dim_uom             ||--o{ fact_po_line      : "единица измерения документа"
+    dim_date            ||--o{ fact_po_line      : "дата заказа"
+    dim_date            ||--o{ fact_po_line      : "плановая дата поставки"
+    ods_po_line_version ||--|| fact_po_line      : "действующая версия строки"
+    ref_fx_rate_daily   ||..o{ fact_po_line      : "курс зафиксирован при загрузке"
+    fact_po_line        ||..o{ fact_receipt      : "ЭТАП 2: план и факт приёмки"
+
+    dim_supplier_golden {
+        bigint  golden_supplier_id PK
+        varchar inn "не UNIQUE: слияние только после подтверждения"
+        text    golden_name
+        char    reliability_class "разрешённый класс"
+        boolean is_merge_confirmed
+        boolean has_attr_conflict "класс A и C у одного ИНН"
+    }
+
+    dim_supplier {
+        bigint  supplier_key PK "суррогат версии SCD2"
+        text    supplier_id "BK из источника"
+        bigint  golden_supplier_id FK
+        text    supplier_name
+        char    reliability_class
+        date    valid_from "у первой версии расширен до 1900-01-01"
+        date    valid_to
+        boolean is_current
+    }
+
+    dim_item {
+        bigint  item_key PK
+        text    item_id UK
+        text    category_master "эталонная категория"
+        text    category_reported "альтернативная классификация"
+        boolean is_unknown "40 позиций вне справочника"
+        boolean has_uom_conflict "закупается в разных базовых единицах"
+    }
+
+    dim_uom {
+        int     uom_key PK
+        text    uom_code UK
+        text    base_uom_code "PCS / KG / M"
+        numeric factor_to_base
+    }
+
+    dim_date {
+        int     date_key PK
+        date    date_actual
+        int     year_month_key
+        int     year_quarter_key
+    }
+
+    ref_fx_rate_daily {
+        date    rate_date PK
+        char    currency_code PK
+        numeric rate_to_rub
+        text    rate_source "actual или carried_forward"
+    }
+
+    ods_po_line_version {
+        text        order_id PK
+        smallint    line_no PK
+        timestamptz updated_at PK
+        numeric     qty
+        numeric     price
+        text        status_src
+        boolean     is_current_version "ровно одна на строку"
+    }
+
+    fact_po_line {
+        bigint      po_line_key PK
+        text        order_id "BK, drill-down до первички"
+        smallint    line_no "BK"
+        bigint      supplier_key FK
+        bigint      item_key FK
+        int         uom_key FK
+        int         order_date_key FK
+        int         planned_delivery_date_key FK
+        char        currency_code
+        numeric     qty
+        numeric     price "в валюте документа"
+        numeric     amount_rub "конвертация зафиксирована при загрузке"
+        numeric     qty_base "приведено к base_uom"
+        numeric     price_per_base_uom_rub
+        boolean     is_cancelled
+        boolean     is_item_unresolved
+        boolean     is_price_scale_suspect
+    }
+
+    fact_receipt {
+        bigint      receipt_key PK "ЭТАП 2"
+        text        receipt_id "BK из wms.receipts.v1"
+        bigint      po_line_key FK "связь с планом"
+        timestamptz received_at_utc
+        numeric     qty_received_base
+        text        quality_status
+    }

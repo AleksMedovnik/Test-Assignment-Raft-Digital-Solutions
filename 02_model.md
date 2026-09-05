@@ -1,4 +1,755 @@
-# Резюме анализа
+# 2. Проектирование аналитического решения
+
+Документ опирается на три входных материала как на единый контекст: конспект стартовой встречи и scope первого релиза в [01_discovery.md](01_discovery.md), результаты профилирования в [data_defects.md](data_defects.md), исходные данные в [data/](data/).
+
+**Обозначения по всему документу:** *Факт* — подтверждается входными материалами или проверкой на данных. *Решение* — архитектурный выбор команды. *Допущение* — то, чего во входных материалах нет и что требует подтверждения заказчиком.
+
+---
+
+## 2.1. Целевая модель и выбор схемы
+
+### Архитектурный подход
+
+Четыре слоя с разной ответственностью — механическое копирование структуры CSV в целевую модель не выполняется ни на одном из переходов:
+
+| Слой | Что содержит | Ответственность |
+|---|---|---|
+| `src` | реплика 1С:УТ на чтение (в датасете — CSV) | источник, не изменяется |
+| `stg` | типизация, объявление временных зон, технические поля загрузки | ничего не решает по бизнесу |
+| `ods` | история версий строк заказа, разрешение актуальной версии, MDM-сопоставление поставщиков | нормализованные данные с историчностью |
+| `dds` | звезда: `fact_po_line` и четыре измерения | целевая аналитическая модель |
+| `mart` | три витрины под конкретные вопросы релиза | ответы на вопросы, а не «универсальный куб» |
+
+Ключевой переход — `ods → dds`: 55 644 строки источника превращаются в 53 248 строк факта, потому что зерно целевой модели — не «строка файла», а **действующая версия строки заказа**.
+
+### Обоснование выбора
+
+**Решение: звезда (star schema).**
+
+- **Объём этого не оспаривает.** 53 тыс. строк факта, 128 поставщиков, 800 позиций. Нормализация ради экономии места бессмысленна, а Data Vault или 3НФ добавили бы слой джойнов без единого выигрыша в этом масштабе и на четырёхнедельном сроке релиза.
+- **Пользователи — не инженеры.** Витрину читают директор по закупкам и категорийные менеджеры, часть работы идёт в BI-инструменте. Звезда даёт предсказуемые джойны «факт → измерение по равенству суррогата» — конструкцию, в которой сложно случайно задвоить факты. Это прямое следствие цели релиза: цифре должны верить.
+- **Снежинка не нужна ровно в одном месте, где её обычно делают.** Категория остаётся атрибутом `dim_item`, а не выносится в отдельную таблицу: иерархия одноуровневая (10 категорий), а её вынос усложнил бы разрез, который является центральным для Ковалёвой.
+- **Единица измерения, наоборот, вынесена в самостоятельное измерение,** хотя интуитивно выглядит атрибутом товара. Причина фактическая: в 82,9% строк единица заказа не совпадает с единицей номенклатуры, то есть единица — свойство строки документа, а не позиции. Сделав её атрибутом `dim_item`, мы бы зафиксировали в модели неверное утверждение.
+- **Одна фактовая таблица в первом релизе.** Все метрики релиза — оборот, цена за единицу, динамика — считаются на одном зерне. Вторая фактовая таблица (`fact_receipt`) появляется на этапе 2 и подключается к существующей звезде по `po_line_key`, не требуя переделки модели.
+
+**Чего в модели сознательно нет:**
+
+| Сущность | Почему отсутствует |
+|---|---|
+| `dim_order` (заказ как сущность) | Метрики релиза считаются на уровне строк; отдельная таблица заказов понадобилась бы для метрики «количество заказов», которая на встрече не звучала. Атрибуты шапки (тип, город, валюта) вырождены в факт. **Следствие, которое нужно проговорить:** 3 572 заказа без строк (16,8%, наблюдение из профилирования) в модель не попадают — это фиксируется DQ-метрикой, а не таблицей |
+| `fact_receipt`, витрина OTIF | Этап 2 по scope. В модели предусмотрены точки подключения (`po_line_key`, `planned_delivery_date_key`, `qty_base`), реализации в DDL нет |
+| Измерения под договоры, тендеры, прайсы, маркетплейсы | Соответствующие источники исключены из первых восьми недель |
+| `dim_currency` | Валют три, и они участвуют только как код и курс. Отдельное измерение не даёт ни одного атрибута для анализа |
+
+### ER-диаграмма
+
+```mermaid
+erDiagram
+    dim_supplier_golden ||--|{ dim_supplier      : "золотая запись объединяет supplier_id по ИНН"
+    dim_supplier        ||--o{ fact_po_line      : "версия, действующая на дату заказа"
+    dim_item            ||--o{ fact_po_line      : "позиция, включая late-arriving"
+    dim_uom             ||--o{ fact_po_line      : "единица измерения документа"
+    dim_date            ||--o{ fact_po_line      : "дата заказа"
+    dim_date            ||--o{ fact_po_line      : "плановая дата поставки"
+    ods_po_line_version ||--|| fact_po_line      : "действующая версия строки"
+    ref_fx_rate_daily   ||..o{ fact_po_line      : "курс зафиксирован при загрузке"
+    fact_po_line        ||..o{ fact_receipt      : "ЭТАП 2: план и факт приёмки"
+
+    dim_supplier_golden {
+        bigint  golden_supplier_id PK
+        varchar inn "не UNIQUE: слияние только после подтверждения"
+        text    golden_name
+        char    reliability_class "разрешённый класс"
+        boolean is_merge_confirmed
+        boolean has_attr_conflict "класс A и C у одного ИНН"
+    }
+
+    dim_supplier {
+        bigint  supplier_key PK "суррогат версии SCD2"
+        text    supplier_id "BK из источника"
+        bigint  golden_supplier_id FK
+        text    supplier_name
+        char    reliability_class
+        date    valid_from "у первой версии расширен до 1900-01-01"
+        date    valid_to
+        boolean is_current
+    }
+
+    dim_item {
+        bigint  item_key PK
+        text    item_id UK
+        text    category_master "эталонная категория"
+        text    category_reported "альтернативная классификация"
+        boolean is_unknown "40 позиций вне справочника"
+        boolean has_uom_conflict "закупается в разных базовых единицах"
+    }
+
+    dim_uom {
+        int     uom_key PK
+        text    uom_code UK
+        text    base_uom_code "PCS / KG / M"
+        numeric factor_to_base
+    }
+
+    dim_date {
+        int     date_key PK
+        date    date_actual
+        int     year_month_key
+        int     year_quarter_key
+    }
+
+    ref_fx_rate_daily {
+        date    rate_date PK
+        char    currency_code PK
+        numeric rate_to_rub
+        text    rate_source "actual или carried_forward"
+    }
+
+    ods_po_line_version {
+        text        order_id PK
+        smallint    line_no PK
+        timestamptz updated_at PK
+        numeric     qty
+        numeric     price
+        text        status_src
+        boolean     is_current_version "ровно одна на строку"
+    }
+
+    fact_po_line {
+        bigint      po_line_key PK
+        text        order_id "BK, drill-down до первички"
+        smallint    line_no "BK"
+        bigint      supplier_key FK
+        bigint      item_key FK
+        int         uom_key FK
+        int         order_date_key FK
+        int         planned_delivery_date_key FK
+        char        currency_code
+        numeric     qty
+        numeric     price "в валюте документа"
+        numeric     amount_rub "конвертация зафиксирована при загрузке"
+        numeric     qty_base "приведено к base_uom"
+        numeric     price_per_base_uom_rub
+        boolean     is_cancelled
+        boolean     is_item_unresolved
+        boolean     is_price_scale_suspect
+    }
+
+    fact_receipt {
+        bigint      receipt_key PK "ЭТАП 2"
+        text        receipt_id "BK из wms.receipts.v1"
+        bigint      po_line_key FK "связь с планом"
+        timestamptz received_at_utc
+        numeric     qty_received_base
+        text        quality_status
+    }
+```
+
+Диаграмма продублирована отдельным файлом [02_model_diagram.mmd](02_model_diagram.mmd). Пунктирная связь с `fact_receipt` показывает точку расширения на этап 2 — в DDL первого релиза этой таблицы нет.
+
+---
+
+## 2.2. Зерно таблиц и витрин
+
+### ods.po_line_version
+
+> **Одна строка = одна уникальная версия строки заказа поставщику: `(order_id, line_no, updated_at)`.**
+
+Проверено на данных: 54 053 уникальных сочетания при 54 053 уникальных полных строках и нуле конфликтов, то есть после схлопывания 1 591 полного дубля ключ честный. Актуальная версия помечена `is_current_version`; частичный уникальный индекс гарантирует, что она ровно одна.
+
+### dds.fact_po_line
+
+> **Одна строка = действующая версия строки заказа поставщику, `(order_id, line_no)`.**
+
+53 248 строк. Это зерно, а не «строка файла» и не «заказ»: заказ содержит от 1 до 5 строк, строка имеет от 1 до 3 версий. Меры `qty`, `amount_doc`, `amount_rub`, `qty_base` аддитивны по всем измерениям; `price` и `price_per_base_uom_rub` **не аддитивны** и агрегируются только как `SUM(amount) / SUM(qty_base)`.
+
+### dds.dim_supplier
+
+> **Одна строка = версия поставщика из источника, `(supplier_id, valid_from)`.**
+
+143 строки на 128 `supplier_id`. Факт ссылается на конкретную версию суррогатом, а не на `supplier_id`.
+
+### dds.dim_supplier_golden
+
+> **Одна строка = юридическое лицо, признанное единым для аналитики.**
+
+До ручного подтверждения — 128 строк (по одной на `supplier_id`), после подтверждения восьми пар — 120.
+
+### dds.dim_item / dds.dim_uom / dds.dim_date
+
+> `dim_item`: **одна строка = позиция номенклатуры, `item_id`** (760 из справочника + 40 late-arriving + Unknown-член).
+> `dim_uom`: **одна строка = код единицы измерения, `uom_code`** (8 + Unknown-член).
+> `dim_date`: **одна строка = календарный день.**
+
+### dds.ref_fx_rate_daily
+
+> **Одна строка = курс валюты на календарный день: `(rate_date, currency_code)`.**
+
+Полный календарь без пропусков: 955 дней × 3 валюты (включая строку RUB = 1,0), из них 272 даты по каждой валюте — протянутые.
+
+### mart.spend_monthly
+
+> **Одна строка = месяц заказа × золотой поставщик × категория.**
+
+Активные и отменённые суммы разведены по колонкам через `FILTER`, а не по строкам — иначе зерно удвоилось бы и `SUM` по витрине давал бы двойной учёт.
+
+### mart.price_benchmark
+
+> **Одна строка = месяц заказа × позиция × базовая единица измерения × золотой поставщик.**
+
+Базовая единица входит в зерно намеренно: это структурная гарантия того, что цена за килограмм никогда не будет сравнена с ценой за штуку. Минимальная цена и переплата считаются оконной функцией внутри группы `(месяц, позиция, базовая единица)`.
+
+### mart.price_dynamics_quarter
+
+> **Одна строка = квартал × позиция × базовая единица измерения.**
+
+Ответ на вопрос «где выросло за квартал». Свод до категории делается **не** усреднением цены (средняя цена по разнородным позициям не имеет смысла), а как число позиций с ростом выше порога и суммарное рублёвое влияние `price_change_impact_rub`.
+
+### dq.run_metric
+
+> **Одна строка = значение одной DQ-метрики в одной загрузке: `(load_id, layer, metric_code)`.**
+
+### Где модель могла бы задвоить факты и что этому препятствует
+
+Требование проверено по каждому соединению, в котором двойной учёт возникает на практике:
+
+| Соединение | Риск | Что препятствует |
+|---|---|---|
+| Строки заказа × версии строк | Суммирование всех версий завышает оборот на 4,47% | Зерно факта — только действующая версия; `UNIQUE (order_id, line_no)` в факте и частичный уникальный индекс `is_current_version` в ODS. История доступна отдельно в `ods.po_line_version` |
+| Строки заказа × полные дубли источника | 1 591 лишняя строка | Схлопывание при загрузке в ODS с записью счётчика в `dq.run_metric` |
+| Факт × версии поставщика | Джойн по диапазону дат (`order_date BETWEEN valid_from AND valid_to`) размножает строку при пересечении периодов и теряет её при разрыве | Версия разрешается **один раз, при загрузке**; в факте лежит суррогат. В запросах — только соединение по равенству. Дополнительно: `EXCLUDE`-ограничение на пересечение периодов и расширение `valid_from` первой версии до `1900-01-01` |
+| Факт × золотая запись поставщика | Соединение через таблицу сопоставления «многие ко многим» | Связь однонаправленная: `dim_supplier.golden_supplier_id` — обычный FK, одна версия принадлежит ровно одной золотой записи. Отдельной bridge-таблицы нет |
+| Заказы × строки | `COUNT(*)` по факту считает строки, а не заказы | В витрине `orders_with_lines` — `COUNT(DISTINCT order_id)`, полуаддитивная мера: складывать её по строкам витрины нельзя, о чём сказано в матрице метрик |
+| Строки заказа × приёмки (этап 2) | 63 691 приёмка против 53 248 строк: соединение «один ко многим» превратит одну опоздавшую строку в несколько «своевременных» событий | Зерно OTIF задаётся строкой заказа, а не приёмкой; приёмки агрегируются до строки **до** расчёта метрики. Это же — рабочая гипотеза расхождения 94% и 71% |
+| Факт × справочник единиц | Строка ссылается на единицу документа, позиция — на справочную | Два разных поля: `fact.uom_key` (единица документа) и `dim_item.ref_uom_code` (справочная). Соединения между ними нет, поэтому размножения нет |
+
+---
+
+## 2.3. DDL целевых таблиц
+
+PostgreSQL. DDL сокращён до того, что определяет физическую структуру: технические поля аудита загрузки, партиционирование и права опущены. Дублируется отдельным файлом [02_ddl.sql](02_ddl.sql).
+
+```sql
+-- =====================================================================
+-- Целевая аналитическая модель закупок. PostgreSQL. Первый релиз.
+-- Сокращённый DDL: показана физическая структура, а не production-обвязка
+-- (партиционирование, права, аудит-поля загрузки опущены).
+-- =====================================================================
+
+CREATE EXTENSION IF NOT EXISTS btree_gist;   -- нужен для EXCLUDE в dim_supplier
+
+CREATE SCHEMA IF NOT EXISTS ods;    -- нормализованный слой: версии, историчность
+CREATE SCHEMA IF NOT EXISTS dds;    -- целевая аналитическая модель (звезда)
+CREATE SCHEMA IF NOT EXISTS mart;   -- витрины под конкретные вопросы
+CREATE SCHEMA IF NOT EXISTS dq;     -- метрики качества данных
+
+-- ---------------------------------------------------------------------
+-- ODS. История версий строк заказа.
+-- Полные дубли строк (1 591 из 55 644) схлопываются на загрузке, их число
+-- пишется в dq.run_metric — это и есть предусмотренный механизм обработки,
+-- позволяющий держать здесь честный первичный ключ.
+-- ---------------------------------------------------------------------
+CREATE TABLE ods.po_line_version (
+    order_id              text          NOT NULL,
+    line_no               smallint      NOT NULL,
+    updated_at            timestamptz   NOT NULL,   -- зона MSK объявляется при загрузке
+    item_id_src           text          NOT NULL,
+    qty                   numeric(18,3) NOT NULL,
+    price                 numeric(18,4) NOT NULL,
+    plan_price            numeric(18,4),
+    uom_code_src          text          NOT NULL,
+    planned_delivery_date date          NOT NULL,
+    status_src            text          NOT NULL,
+    is_current_version    boolean       NOT NULL,
+    src_dup_cnt           smallint      NOT NULL DEFAULT 1,  -- сколько раз строка пришла из источника
+    load_id               bigint        NOT NULL,
+    CONSTRAINT pk_po_line_version PRIMARY KEY (order_id, line_no, updated_at),
+    CONSTRAINT ck_po_line_status  CHECK (status_src IN ('active','cancelled')),
+    CONSTRAINT ck_po_line_qty     CHECK (qty > 0 AND price >= 0)
+);
+
+-- Структурная защита от дефекта 1: у строки заказа ровно одна действующая версия
+CREATE UNIQUE INDEX uq_po_line_current
+    ON ods.po_line_version (order_id, line_no) WHERE is_current_version;
+
+CREATE INDEX ix_po_line_version_key ON ods.po_line_version (order_id, line_no);
+
+-- ---------------------------------------------------------------------
+-- Справочник курсов. Полный календарь: выходные (272 даты) заполняются
+-- протяжкой последнего known-курса с явным признаком происхождения.
+-- Строка RUB = 1.0 хранится, чтобы ETL и витрины не содержали CASE по валюте.
+-- ---------------------------------------------------------------------
+CREATE TABLE dds.ref_fx_rate_daily (
+    rate_date     date          NOT NULL,
+    currency_code char(3)       NOT NULL,
+    rate_to_rub   numeric(18,6) NOT NULL,
+    rate_source   text          NOT NULL,
+    CONSTRAINT pk_fx_rate    PRIMARY KEY (rate_date, currency_code),
+    CONSTRAINT ck_fx_rate    CHECK (rate_to_rub > 0),
+    CONSTRAINT ck_fx_source  CHECK (rate_source IN ('actual','carried_forward'))
+);
+
+-- ---------------------------------------------------------------------
+-- Измерения
+-- ---------------------------------------------------------------------
+CREATE TABLE dds.dim_date (
+    date_key         int     PRIMARY KEY,          -- YYYYMMDD
+    date_actual      date    NOT NULL UNIQUE,
+    year_month_key   int     NOT NULL,             -- YYYYMM
+    year_quarter_key int     NOT NULL,             -- YYYYQ
+    quarter_no       smallint NOT NULL,
+    month_no         smallint NOT NULL,
+    is_weekend       boolean NOT NULL
+);
+
+-- Золотая запись поставщика (MDM). UNIQUE(inn) сознательно НЕ ставится:
+-- один ИНН может законно обслуживать несколько учётных записей, и до ручного
+-- подтверждения каждая запись источника получает собственную золотую запись.
+CREATE TABLE dds.dim_supplier_golden (
+    golden_supplier_id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    inn                varchar(12) NOT NULL,
+    golden_name        text        NOT NULL,
+    region             text,
+    reliability_class  char(1),
+    is_merge_confirmed boolean     NOT NULL DEFAULT false,
+    has_attr_conflict  boolean     NOT NULL DEFAULT false,  -- класс A и C у одного ИНН
+    confirmed_by       text,
+    confirmed_at       timestamptz,
+    CONSTRAINT ck_golden_inn CHECK (inn ~ '^[0-9]{10}$' OR inn ~ '^[0-9]{12}$')
+);
+CREATE INDEX ix_golden_inn ON dds.dim_supplier_golden (inn);
+
+-- SCD2 по версиям источника. valid_from самой ранней версии расширяется
+-- до 1900-01-01, иначе 230 заказов остаются без действующей версии поставщика.
+CREATE TABLE dds.dim_supplier (
+    supplier_key       bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    supplier_id        text        NOT NULL,
+    golden_supplier_id bigint      NOT NULL REFERENCES dds.dim_supplier_golden,
+    supplier_name      text        NOT NULL,
+    supplier_name_norm text        NOT NULL,   -- TRIM + схлопывание пробелов + регистр
+    inn                varchar(12) NOT NULL,
+    region             text,
+    reliability_class  char(1),
+    valid_from         date        NOT NULL,
+    valid_to           date        NOT NULL DEFAULT DATE '9999-12-31',
+    is_current         boolean     NOT NULL,
+    CONSTRAINT uq_supplier_version UNIQUE (supplier_id, valid_from),
+    CONSTRAINT ck_supplier_period  CHECK (valid_from <= valid_to),
+    -- периоды историчности одного поставщика не пересекаются (на данных нарушений нет)
+    CONSTRAINT ex_supplier_overlap EXCLUDE USING gist (
+        supplier_id WITH =, daterange(valid_from, valid_to, '[]') WITH &&)
+);
+-- не более одной актуальной версии на поставщика
+CREATE UNIQUE INDEX uq_supplier_current
+    ON dds.dim_supplier (supplier_id) WHERE is_current;
+CREATE INDEX ix_supplier_golden ON dds.dim_supplier (golden_supplier_id);
+
+-- Номенклатура. 40 позиций, отсутствующих в справочнике, грузятся как
+-- late-arriving stub (is_unknown = true) и обогащаются на месте после догрузки
+-- справочника — без перезагрузки фактов.
+CREATE TABLE dds.dim_item (
+    item_key              bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    item_id               text    NOT NULL,
+    item_name             text,
+    category_master       text    NOT NULL DEFAULT 'Не определена',
+    category_reported     text,
+    has_category_conflict boolean NOT NULL DEFAULT false,   -- 33 позиции
+    ref_uom_code          text,                             -- единица из справочника
+    is_unknown            boolean NOT NULL DEFAULT false,
+    has_uom_conflict      boolean NOT NULL DEFAULT false,   -- закупки в разных базовых единицах
+    CONSTRAINT uq_item UNIQUE (item_id)
+);
+CREATE INDEX ix_item_category ON dds.dim_item (category_master);
+
+CREATE TABLE dds.dim_uom (
+    uom_key        int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    uom_code       text          NOT NULL,
+    uom_name       text,
+    base_uom_code  text          NOT NULL,   -- PCS / KG / M
+    factor_to_base numeric(18,6) NOT NULL,
+    CONSTRAINT uq_uom       UNIQUE (uom_code),
+    CONSTRAINT ck_uom_factor CHECK (factor_to_base > 0)
+);
+
+-- Unknown-члены измерений (ключ -1). IDENTITY объявлен BY DEFAULT именно
+-- для того, чтобы эти строки можно было вставить с явным ключом.
+INSERT INTO dds.dim_supplier_golden (golden_supplier_id, inn, golden_name)
+VALUES (-1, '0000000000', 'Не определён');
+INSERT INTO dds.dim_supplier (supplier_key, supplier_id, golden_supplier_id, supplier_name,
+                              supplier_name_norm, inn, valid_from, valid_to, is_current)
+VALUES (-1, '#UNKNOWN', -1, 'Не определён', 'не определён', '0000000000',
+        DATE '1900-01-01', DATE '9999-12-31', true);
+INSERT INTO dds.dim_item (item_key, item_id, item_name, is_unknown)
+VALUES (-1, '#UNKNOWN', 'Не определена', true);
+INSERT INTO dds.dim_uom (uom_key, uom_code, uom_name, base_uom_code, factor_to_base)
+VALUES (-1, '#UNKNOWN', 'Не определена', '#UNKNOWN', 1.0);
+
+-- ---------------------------------------------------------------------
+-- Фактовая таблица первого релиза.
+-- Зерно: одна действующая версия строки заказа поставщику.
+-- ---------------------------------------------------------------------
+CREATE TABLE dds.fact_po_line (
+    po_line_key               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+
+    -- бизнес-ключ и drill-down до первичного документа
+    order_id                  text     NOT NULL,
+    line_no                   smallint NOT NULL,
+
+    -- измерения
+    supplier_key              bigint   NOT NULL REFERENCES dds.dim_supplier,
+    item_key                  bigint   NOT NULL REFERENCES dds.dim_item,
+    uom_key                   int      NOT NULL REFERENCES dds.dim_uom,
+    order_date_key            int      NOT NULL REFERENCES dds.dim_date,
+    planned_delivery_date_key int      NOT NULL REFERENCES dds.dim_date,
+
+    -- вырожденные атрибуты заказа (отдельная сущность «заказ» в scope не нужна)
+    order_dttm_msk            timestamptz NOT NULL,
+    order_type                text     NOT NULL,
+    delivery_city             text,
+    item_id_src               text     NOT NULL,   -- исходный код позиции сохраняется всегда
+
+    -- меры в валюте документа
+    currency_code             char(3)       NOT NULL,
+    qty                       numeric(18,3) NOT NULL,
+    price                     numeric(18,4) NOT NULL,
+    plan_price                numeric(18,4),
+    amount_doc                numeric(20,4) GENERATED ALWAYS AS (qty * price) STORED,
+
+    -- нормализация валюты: курс фиксируется в строке факта
+    fx_rate                   numeric(18,6) NOT NULL,
+    fx_rate_date              date          NOT NULL,
+    fx_rate_source            text          NOT NULL,
+    amount_rub                numeric(20,4) NOT NULL,
+
+    -- нормализация единиц измерения
+    base_uom_code             text          NOT NULL,
+    qty_base                  numeric(20,4) NOT NULL,
+    -- вычисляемое поле: цена за базовую единицу не может разойтись с суммой и количеством
+    price_per_base_uom_rub    numeric(20,6) GENERATED ALWAYS AS (amount_rub / qty_base) STORED,
+
+    -- состояние строки
+    is_cancelled              boolean     NOT NULL,
+    version_updated_at        timestamptz NOT NULL,
+    version_cnt               smallint    NOT NULL,   -- сколько версий было у строки
+
+    -- флаги качества данных, влияющие на допустимость строки в метриках
+    is_item_unresolved        boolean NOT NULL DEFAULT false,
+    is_price_scale_suspect    boolean NOT NULL DEFAULT false,
+    load_id                   bigint  NOT NULL,
+
+    CONSTRAINT uq_fact_po_line UNIQUE (order_id, line_no),   -- защита от двойного учёта
+    CONSTRAINT ck_fact_qty      CHECK (qty > 0),
+    CONSTRAINT ck_fact_price    CHECK (price >= 0),
+    CONSTRAINT ck_fact_qty_base CHECK (qty_base > 0),
+    CONSTRAINT ck_fact_fx       CHECK (fx_rate > 0),
+    CONSTRAINT ck_fact_fx_src   CHECK (fx_rate_source IN ('actual','carried_forward'))
+);
+
+CREATE INDEX ix_fact_supplier   ON dds.fact_po_line (supplier_key);
+CREATE INDEX ix_fact_item_base  ON dds.fact_po_line (item_key, base_uom_code);
+CREATE INDEX ix_fact_order_date ON dds.fact_po_line (order_date_key);
+CREATE INDEX ix_fact_plan_date  ON dds.fact_po_line (planned_delivery_date_key);
+CREATE INDEX ix_fact_active     ON dds.fact_po_line (order_date_key, item_key)
+    WHERE NOT is_cancelled;
+
+-- ---------------------------------------------------------------------
+-- Метрики качества данных: без них «доверие к цифрам» не проверяемо
+-- ---------------------------------------------------------------------
+CREATE TABLE dq.run_metric (
+    load_id      bigint        NOT NULL,
+    run_at       timestamptz   NOT NULL DEFAULT now(),
+    layer        text          NOT NULL,
+    metric_code  text          NOT NULL,   -- dup_line_key_pct, unknown_item_amount_pct, ...
+    metric_value numeric(20,6) NOT NULL,
+    threshold    numeric(20,6),
+    severity     text          NOT NULL,
+    CONSTRAINT pk_dq_run_metric PRIMARY KEY (load_id, layer, metric_code),
+    CONSTRAINT ck_dq_severity   CHECK (severity IN ('info','warn','block'))
+);
+
+-- ---------------------------------------------------------------------
+-- Витрины
+-- ---------------------------------------------------------------------
+
+-- Оборот: месяц x золотой поставщик x категория
+CREATE MATERIALIZED VIEW mart.spend_monthly AS
+SELECT d.year_month_key,
+       s.golden_supplier_id,
+       i.category_master,
+       SUM(f.amount_rub)  FILTER (WHERE NOT f.is_cancelled)                        AS amount_rub_active,
+       SUM(f.amount_rub)  FILTER (WHERE f.is_cancelled)                            AS amount_rub_cancelled,
+       SUM(f.amount_rub)  FILTER (WHERE NOT f.is_cancelled AND f.is_item_unresolved) AS amount_rub_item_unresolved,
+       SUM(f.amount_rub)  FILTER (WHERE NOT f.is_cancelled AND f.fx_rate_source = 'carried_forward') AS amount_rub_fx_carried,
+       COUNT(*)           FILTER (WHERE NOT f.is_cancelled)                        AS lines_active,
+       COUNT(*)           FILTER (WHERE f.is_cancelled)                            AS lines_cancelled,
+       COUNT(DISTINCT f.order_id) FILTER (WHERE NOT f.is_cancelled)                AS orders_with_lines
+FROM dds.fact_po_line f
+JOIN dds.dim_supplier s ON s.supplier_key = f.supplier_key
+JOIN dds.dim_item     i ON i.item_key     = f.item_key
+JOIN dds.dim_date     d ON d.date_key     = f.order_date_key
+GROUP BY 1, 2, 3;
+
+CREATE UNIQUE INDEX uq_spend_monthly
+    ON mart.spend_monthly (year_month_key, golden_supplier_id, category_master);
+
+-- Сравнение цен: базовая единица входит в зерно, поэтому кг никогда
+-- не сравнивается со штуками. Юаневые строки исключены (дефект масштаба цен).
+CREATE MATERIALIZED VIEW mart.price_benchmark AS
+WITH base AS (
+    SELECT d.year_month_key,
+           f.item_key,
+           f.base_uom_code,
+           s.golden_supplier_id,
+           SUM(f.qty_base)   AS qty_base,
+           SUM(f.amount_rub) AS amount_rub
+    FROM dds.fact_po_line f
+    JOIN dds.dim_supplier s ON s.supplier_key = f.supplier_key
+    JOIN dds.dim_date     d ON d.date_key     = f.order_date_key
+    WHERE NOT f.is_cancelled
+      AND NOT f.is_price_scale_suspect
+    GROUP BY 1, 2, 3, 4
+)
+SELECT b.year_month_key,
+       b.item_key,
+       b.base_uom_code,
+       b.golden_supplier_id,
+       b.qty_base,
+       b.amount_rub,
+       b.amount_rub / b.qty_base                                          AS price_per_base_uom,
+       MIN(b.amount_rub / b.qty_base) OVER w                              AS min_price_in_group,
+       COUNT(*) OVER w                                                    AS suppliers_in_group,
+       b.amount_rub - b.qty_base * MIN(b.amount_rub / b.qty_base) OVER w  AS overpay_rub
+FROM base b
+WINDOW w AS (PARTITION BY b.year_month_key, b.item_key, b.base_uom_code);
+
+CREATE UNIQUE INDEX uq_price_benchmark
+    ON mart.price_benchmark (year_month_key, item_key, base_uom_code, golden_supplier_id);
+
+-- Динамика цены по кварталам: ответ на вопрос «где выросло за квартал»
+CREATE MATERIALIZED VIEW mart.price_dynamics_quarter AS
+WITH q AS (
+    SELECT d.year_quarter_key,
+           f.item_key,
+           f.base_uom_code,
+           SUM(f.qty_base)   AS qty_base,
+           SUM(f.amount_rub) AS amount_rub
+    FROM dds.fact_po_line f
+    JOIN dds.dim_date d ON d.date_key = f.order_date_key
+    WHERE NOT f.is_cancelled
+      AND NOT f.is_price_scale_suspect
+    GROUP BY 1, 2, 3
+)
+SELECT q.year_quarter_key,
+       q.item_key,
+       q.base_uom_code,
+       q.qty_base,
+       q.amount_rub,
+       q.amount_rub / q.qty_base AS price_per_base_uom,
+       LAG(q.amount_rub / q.qty_base) OVER w AS price_prev_quarter,
+       (q.amount_rub / q.qty_base) / NULLIF(LAG(q.amount_rub / q.qty_base) OVER w, 0) - 1 AS price_change_pct,
+       ((q.amount_rub / q.qty_base) - LAG(q.amount_rub / q.qty_base) OVER w) * q.qty_base AS price_change_impact_rub
+FROM q
+WINDOW w AS (PARTITION BY q.item_key, q.base_uom_code ORDER BY q.year_quarter_key);
+
+CREATE UNIQUE INDEX uq_price_dynamics_quarter
+    ON mart.price_dynamics_quarter (year_quarter_key, item_key, base_uom_code);
+```
+
+---
+
+## 2.4. Обработка сложных случаев
+
+### Историчность поставщика
+
+**Факты из данных.** `suppliers.csv` уже приходит как SCD2: 143 строки на 128 `supplier_id`, поля `valid_from` / `valid_to` / `is_current`. Механизм историчности исправен — пересечений периодов нет, разрывов нет, двух актуальных версий на поставщика нет. При этом есть три содержательные проблемы: 8 значений ИНН закреплены за двумя `supplier_id` каждое (12,3% оборота), у дублирующих записей `valid_from` наступает позже первых заказов по ним (230 заказов вне периода действия), в трёх парах `reliability_class` противоречив (например, C у `S1008` и A у `S1122` при одном ИНН).
+
+**Решение: SCD2 на уровне версии источника плюс отдельная золотая запись (MDM).**
+
+Почему именно SCD2, а не Type 1 и не Type 3:
+
+- Переименование «АО "ВолгаТех-1"» → «АО "ВолгаТех-1 Групп"» не должно переписывать историю закупок. Type 1 затёр бы прежнее наименование, и отчёт за прошлый год перестал бы совпадать с первичными документами — это прямо противоречит требованию drill-down до первички.
+- Класс надёжности меняется во времени, и вопрос «какой класс был у поставщика в момент размещения заказа» осмыслен. Type 3 (колонка «предыдущее значение») выдерживает одно изменение, а в данных у поставщика бывает несколько версий.
+- Источник уже ведёт историчность — воспроизводить её в целевой модели дешевле, чем разрушать.
+
+**Как это работает физически.** Версия разрешается один раз, на загрузке: по дате заказа выбирается действующая версия, и в факт кладётся её суррогат `supplier_key`. В запросах — только соединение по равенству. Джойн по диапазону дат в витринах запрещён: именно он превращает одну строку заказа в несколько при малейшем пересечении периодов.
+
+**Как обрабатываются найденные дефекты:**
+
+| Дефект | Обработка | Автоматизм |
+|---|---|---|
+| `valid_from` позже первых заказов (230 шт.) | `valid_from` самой ранней версии расширяется до `1900-01-01` (open-ended initial period). Содержательная история изменений не искажается, но каждый заказ получает версию | Автоматически на загрузке |
+| 8 пар дублей по ИНН | Кандидаты формируются детерминированным правилом (совпадение ИНН + нормализованное наименование), но **слияние не выполняется без подтверждения**. До подтверждения каждая запись источника имеет собственную золотую запись, и модель работает с первого дня | Кандидаты — автоматически, слияние — вручную |
+| Хвостовые пробелы в наименованиях (8 записей) | `supplier_name_norm`: TRIM, схлопывание пробелов, регистр. Исходное наименование сохраняется | Автоматически |
+| Противоречивый `reliability_class` (3 пары) | Автоматически не разрешается: в золотой записи ставится `has_attr_conflict`, для отчётности берётся класс версии с более поздним `valid_from`, конфликт виден пользователю | Флаг автоматически, разрешение вручную |
+
+**Почему `UNIQUE (inn)` на золотой записи нет.** Один ИНН может законно обслуживать несколько учётных записей — филиалы, разные договорные схемы. Жёсткое ограничение заставило бы либо сливать записи без подтверждения, либо блокировать загрузку. Вместо него — индекс по ИНН и DQ-метрика «число ИНН более чем с одной золотой записью», которая держит эти 8 пар на виду, пока их не разберут.
+
+### Мультивалютность
+
+**Факты из данных.** Три валюты заказов: RUB 18 192, USD 2 101, CNY 999. Справочник курсов содержит USD и CNY, 683 даты из 955 календарных — отсутствуют ровно выходные (272 даты). 261 валютный заказ (609 строк) размещён в выходные, для них курса на дату заказа нет: наивный `INNER JOIN` теряет 0,92% оборота. Отдельно подтверждено, что цены в CNY после конвертации в 7 раз ниже сопоставимых рублёвых по той же позиции и той же единице (медиана отношения 0,141 при контрольных 0,983 по USD).
+
+**Что хранится.** В каждой строке факта одновременно:
+
+- `currency_code`, `price`, `qty`, `amount_doc` — как в первичном документе;
+- `fx_rate`, `fx_rate_date`, `fx_rate_source` — какой именно курс применён;
+- `amount_rub` — результат конвертации.
+
+**Где происходит конвертация. Решение: при загрузке в `dds`, а не в запросе витрины.** Причина — воспроизводимость: отчёт, перестроенный через год, обязан дать ту же цифру, что и сегодня. Если конвертировать в момент запроса, любое уточнение справочника курсов задним числом молча изменит уже показанные правлению цифры. Зафиксированный в строке курс делает пересчёт осознанным действием, а не побочным эффектом.
+
+**Какой курс используется. Допущение, требующее подтверждения.** Во входных материалах правило выбора даты курса не зафиксировано. Принимается рабочее правило: **курс на дату размещения заказа** (`order_dttm_msk::date`), поскольку цена в строке фиксируется в момент размещения. Альтернативы, между которыми должен выбрать заказчик, — курс на дату приёмки, курс на конец месяца, курс из договора. Правило входит в состав «правил расчёта оборота», которые по scope должны быть согласованы к концу второй недели.
+
+**Выходные дни.** Справочник строится на полном календаре, курс на нерабочие дни протягивается последним известным (LOCF) с `rate_source = 'carried_forward'`. Загрузка курсов — блокирующая проверка: ни одна дата периода не должна остаться без курса по каждой валюте. Отдельный алерт срабатывает, если протяжка длится более 5 дней подряд — это уже не выходные, а остановка источника.
+
+**Масштаб цен в CNY.** Автоматическая коррекция не применяется — коэффициент был бы догадкой, а молчаливая правка цен скрыла бы проблему источника. Строки получают `is_price_scale_suspect`, остаются в обороте (0,7%, на итог не влияет) и исключаются из витрин сравнения цен, где их влияние критично: без исключения 29,5% позиций получили бы «самого дешёвого поставщика» из заниженной юаневой закупки.
+
+### Единицы измерения
+
+**Факты из данных.** Справочник `uom` корректен: 8 кодов, у каждого заполнены `base_uom` и `factor_to_base` (`PACK6` → 6 PCS, `TON` → 1000 KG, `ROLL50` → 50 M). Проблема не в справочнике, а в его применении: в 82,9% строк единица заказа не совпадает с единицей номенклатуры, и все 800 закупаемых позиций встречаются в трёх взаимно несводимых базовых единицах — штуках, килограммах и метрах.
+
+**Решение — три уровня.**
+
+1. **Хранить оригинал и вычислять нормализованное.** В факте лежат `qty`, `price`, `uom_key` как в документе и рядом `qty_base`, `base_uom_code`, `price_per_base_uom_rub`. Без исходных значений drill-down перестал бы сходиться с первичкой.
+2. **Цена за базовую единицу — вычисляемое поле БД** (`GENERATED ALWAYS AS (amount_rub / qty_base) STORED`), а не результат расчёта в отчёте. Это исключает класс ошибок, при котором в разных дашбордах цена считается по-разному.
+3. **Базовая единица входит в зерно витрины сравнения цен.** Сравнение всегда идёт внутри группы «позиция + базовая единица», поэтому килограммы структурно не могут быть сопоставлены со штуками.
+
+**Уточнение предыдущей рекомендации.** В [data_defects.md](data_defects.md) для этого дефекта предлагалось исключать конфликтующие позиции из витрины сравнения цен. На этапе проектирования это решение уточнено: конфликт затрагивает **все 800 позиций**, и буквальное исключение оставило бы витрину пустой. Правильная реализация той же идеи — не исключение позиций, а **сегментация по базовой единице внутри зерна**: сравнение остаётся корректным, а флаг `has_uom_conflict` в `dim_item` предупреждает, что закупки позиции раздроблены между несовместимыми единицами и вывод «этот поставщик дешевле» покрывает лишь часть объёма.
+
+**Допущение.** Единица строки заказа трактуется как учётная единица документа (именно она определяет `qty` и `price` в первичке), а `items.uom_code` — как справочное значение по умолчанию. Владелец справочника номенклатуры должен это подтвердить: если эталоном объявляется единица номенклатуры, все 44 138 строк с расхождением требуют пересчёта количества, а не только маркировки.
+
+### Изменения и отмены заказов
+
+**Факты из данных.** У 2 375 строк заказа ключ `(order_id, line_no)` встречается более одного раза: 1 570 групп — полные технические дубли, 805 — версии, различающиеся `qty`, `price` и `updated_at`. Признака актуальности в источнике нет. Отменённых строк — 3 154 (5,88% оборота). Проверено: 356 строк выглядят как перепоставка только потому, что количество в заказе было снижено задним числом; превышений над максимумом по всем версиям нет ни одного.
+
+**Что считается текущим состоянием. Решение:** версия с максимальным `updated_at` в пределах `(order_id, line_no)`. Другого признака в источнике не существует, поэтому правило детерминировано и воспроизводимо.
+
+**Как учитываются изменения.** Все версии сохраняются в `ods.po_line_version` — это не архив «на всякий случай», а рабочая необходимость: без истории версий невозможно ответить на вопрос «почему сумма закупки изменилась» и невозможно корректно посчитать OTIF на этапе 2 (см. ниже). В факт попадает только действующая версия, счётчик `version_cnt` показывает, сколько раз строка пересматривалась.
+
+**Как отмены влияют на факты. Решение:** отменённые строки **загружаются**, помечаются `is_cancelled` и **исключаются из метрик по умолчанию**. Удалять их нельзя — тогда исчезнет возможность считать долю отменённых как самостоятельный показатель качества планирования. Витрина `spend_monthly` разводит активные и отменённые суммы по колонкам, а не по строкам, поэтому зерно витрины не меняется.
+
+**Допущение.** Правило «оборот считается по активным строкам» логично, но во входных материалах не зафиксировано, а цена вопроса — 5,88% оборота. Оно входит в те же «правила расчёта оборота», которые утверждаются к концу второй недели.
+
+**Как избежать двойного учёта.** Три механизма работают вместе: частичный уникальный индекс на действующую версию в ODS, `UNIQUE (order_id, line_no)` в факте и DQ-метрика доли дублей ключа в источнике с порогом на текущем уровне 4,3%. Рост метрики означает, что источник начал отдавать историю вместо снимка, — это ловится на загрузке, а не в отчёте у директора.
+
+**Связь с этапом 2.** Плановое количество для OTIF нельзя брать из последней версии строки: снижение `qty` задним числом маскирует недопоставку — ровно тот механизм, который породил 356 ложных перепоставок. Поэтому история версий в ODS является обязательным фундаментом OTIF, а не опциональным архивом.
+
+### Отсутствующая номенклатура
+
+**Факты из данных.** 2 731 строка (5,1%) ссылается на 40 `item_id`, отсутствующих в справочнике. Оборот по ним — 5,22 млрд руб, те же 5,1%. Отсутствующие коды лежат внутри диапазона справочника (`IT10038` … `IT10777` при охвате `IT10000`–`IT10799`), то есть это неполная выгрузка справочника, а не мусор в заказах.
+
+**Решение: late-arriving dimension member, а не единый Unknown-мешок.** Для каждого из 40 кодов в `dim_item` создаётся заготовка с сохранённым `item_id`, `is_unknown = true` и категорией «Не определена». Дополнительно существует классический Unknown-член с ключом `-1` — на случай пустого или неразбираемого кода позиции (сейчас таких нет).
+
+Почему именно так, а не сваливание всех 40 кодов в `item_key = -1`:
+
+- **Факт закупки сохраняется полностью** — 5,22 млрд остаются в обороте, ни одна строка не теряется.
+- **Проблема качества данных остаётся видимой** — в разрезе по категориям присутствует строка «Не определена» с явной суммой, а не молчаливый провал; аналитик видит масштаб пробела.
+- **Сравнение цен по этим позициям продолжает работать**: цены одного `item_id` у разных поставщиков сопоставимы и без справочника, поскольку единица измерения берётся из строки заказа. Единый Unknown-мешок эту возможность уничтожил бы, слив 40 разных товаров в одну строку.
+- **После догрузки справочника заготовка обогащается на месте**, с сохранением суррогатного ключа: факты не перезагружаются, история отчётов не ломается.
+
+Дополнительно `item_id_src` хранится в самом факте — это страховка на случай, если сопоставление придётся пересобирать.
+
+**Контроль:** DQ-метрика «доля оборота на неопознанной номенклатуре» с базовым уровнем 5,1%. Загрузка не блокируется, но публикация витрины по категориям останавливается при превышении согласованного порога — иначе разрез по категориям начнёт незаметно расходиться с общим оборотом.
+
+---
+
+## 2.5. Матрица метрик
+
+Метрики 1–9 реализуются в первом релизе, метрика 10 — на этапе 2. Все рассчитываются на `dds.fact_po_line`, если не указано иное.
+
+| Метрика | Бизнес-определение | Зерно | Источники | Формула | Подводные камни |
+|---|---|---|---|---|---|
+| **1. Оборот закупок** | Стоимость размещённых заказов в рублях по действующим неотменённым строкам | Строка заказа, агрегируется до месяца × поставщика × категории | `fact_po_line` | `SUM(amount_rub) WHERE NOT is_cancelled` | Наивный расчёт по всем строкам файла завышает на 4,47%; включение отменённых меняет цифру на 5,88%; `INNER JOIN` с курсами теряет 0,92%. Итоговый разрыв «в лоб» против очищенного — 17,0% |
+| **2. Цена за базовую единицу** | Средневзвешенная фактическая цена за единицу в базовой единице измерения | Позиция × базовая единица × поставщик × период | `fact_po_line`, `dim_uom` | `SUM(amount_rub) / SUM(qty_base)` | Категорически не `AVG(price)`: цена не аддитивна, а единицы разнородны — простое среднее даёт ошибку до 8 раз. Юаневые строки исключаются |
+| **3. Потенциал экономии (переплата)** | Насколько дороже минимальной цены на ту же позицию в том же периоде закуплен объём | Позиция × базовая единица × поставщик × месяц | `mart.price_benchmark` | `SUM(amount_rub) − SUM(qty_base) × MIN(price_per_base_uom)` в группе | Минимум обязан считаться внутри одной базовой единицы и без юаневых строк, иначе 29,5% минимумов окажутся артефактом конвертации. Требует порога по объёму: минимум на разовой мелкой закупке нерепрезентативен |
+| **4. Разброс цен между поставщиками** | Отношение максимальной цены за базовую единицу к минимальной по позиции | Позиция × базовая единица × месяц | `mart.price_benchmark` | `MAX(price_per_base_uom) / MIN(price_per_base_uom)` | Показателен только при `suppliers_in_group >= 2`; на позициях с `has_uom_conflict` покрывает лишь часть объёма закупки |
+| **5. Изменение цены за квартал** | Рост или снижение цены за базовую единицу к предыдущему кварталу | Позиция × базовая единица × квартал | `mart.price_dynamics_quarter` | `price_per_base_uom / LAG(price_per_base_uom) − 1` | Прямой ответ на вопрос «где выросло за квартал». Свод до категории — не усреднением цены, а числом позиций с ростом и суммой `price_change_impact_rub`. На малых объёмах даёт шум: нужен порог по `qty_base` |
+| **6. Доля поставщика в обороте** | Доля закупок у одного юридического лица в обороте категории или компании | Золотой поставщик × категория × период | `fact_po_line`, `dim_supplier`, `dim_supplier_golden` | `SUM(amount_rub) по golden_supplier_id / SUM(amount_rub)` | Без склейки по ИНН ТОП-5 поставщиков неверен целиком: в сыром виде туда не попадает ни один из восьми дублированных, после склейки они занимают все пять мест |
+| **7. Число альтернативных поставщиков по позиции** | Сколько разных юридических лиц поставляли позицию в периоде | Позиция × базовая единица × период | `mart.price_benchmark` | `COUNT(DISTINCT golden_supplier_id)` | Показывает, есть ли у переплаты альтернатива: при единственном поставщике метрика 3 не является поводом для действия. Полуаддитивна — не суммируется по позициям |
+| **8. Доля срочных и аварийных закупок** | Доля оборота по заказам типов «Срочная» и «Аварийная» | Тип заказа × категория × период | `fact_po_line` (вырожденный атрибут `order_type`) | `SUM(amount_rub) FILTER (WHERE order_type <> 'Плановая') / SUM(amount_rub)` | Объясняющая метрика к вопросу «где переплачиваем»: сопоставляется с ценой за базовую единицу по тем же позициям. Сама по себе выводов не даёт |
+| **9. Доля отменённых строк** | Доля отменённых строк в количестве и в сумме | Категория × поставщик × период | `fact_po_line` | `SUM(amount_rub) FILTER (WHERE is_cancelled) / SUM(amount_rub)` | Единственная метрика, где отменённые строки берутся намеренно. Знаменатель обязан включать отменённые — иначе доля посчитается от неправильной базы |
+| **10. OTIF (этап 2)** | Доля строк заказа, поставленных вовремя и в полном объёме | Строка заказа | `fact_po_line` + `fact_receipt` | См. каноническое определение ниже | Приёмок 63 691 против 53 248 строк: соединение без предварительной агрегации до строки завышает метрику. Отдельно влияют статус качества, отменённые строки, часовой пояс и выбор версии плана |
+
+**DQ-метрики,** которые выводятся на дашборд рядом с бизнес-цифрами, потому что цель релиза — доверие к ним: доля оборота на неопознанной номенклатуре (5,1%), доля оборота с протянутым курсом, доля дублей ключа в источнике (4,3%), число ИНН более чем с одной золотой записью (8).
+
+### Каноническое определение OTIF
+
+**Решение.**
+
+> **OTIF** — доля строк заказа, по которым поставка выполнена **и в срок, и в полном объёме**, среди всех действующих неотменённых строк, плановая дата поставки которых попадает в отчётный период.
+
+**Зерно расчёта: одна действующая строка заказа `(order_id, line_no)`.** Это принципиальный выбор. Приёмка не может быть зерном: одна строка дробится на 1–3 события приёмки, и подсчёт по событиям механически завышает метрику, поскольку одна опоздавшая строка порождает несколько «своевременных» приходов. Приёмки агрегируются до строки **до** вычисления метрики.
+
+**Период атрибуции: по плановой дате поставки**, а не по дате приёмки. Иначе задержанные поставки уезжают в следующий период, и метрика улучшается ровно за счёт худших случаев.
+
+**On Time.** Дата последней приёмки, засчитанной в поставку, не позже плановой даты поставки, приведённой к концу суток в московской зоне:
+
+```
+max(received_at_msk) <= planned_delivery_date + допуск_дней
+```
+
+**In Full.** Сумма принятого количества, приведённая к базовой единице, не меньше планового количества:
+
+```
+SUM(qty_received_base) FILTER (quality_status = 'accepted') >= qty_base_план × (1 − допуск_количества)
+```
+
+**Строка без единой приёмки после наступления плановой даты засчитывается как невыполненная** — попадает в знаменатель и не попадает в числитель. Без этого правила метрика завышается на самых тяжёлых случаях.
+
+**Параметры версии v1, подлежащие утверждению владельцем метрики** (хранятся в конфигурации, а не в коде, чтобы изменение вело к пересчёту истории, а не к переписыванию витрины):
+
+| Параметр | Значение v1 | Почему так |
+|---|---|---|
+| Допуск по сроку | 0 дней | Любой допуск — управленческое решение, а не техническое |
+| Допуск по количеству | 0% | То же |
+| Статусы качества в In Full | только `accepted` | `rejected` и `partially_rejected` — это непоставленный товар |
+| Отменённые строки | исключаются из числителя и знаменателя одновременно | Иначе появляется факт без плана |
+| Версия плана | версия строки, действовавшая на плановую дату поставки | Иначе снижение количества задним числом маскирует недопоставку — ровно механизм 356 ложных перепоставок |
+| Часовая зона | всё приводится к MSK | Единая бизнес-зона заказчика |
+
+### Почему сейчас могут получаться 94% и 71%
+
+**Важная оговорка.** Методики, которыми сегодня пользуются логистика и категорийный менеджмент, во входных материалах не описаны. Ниже — **гипотезы**, каждая из которых проверяема на данных; ни одна не утверждается как факт. Числа в правой колонке — результат расчёта на этом датасете при переключении соответствующего правила, а не реконструкция чужих методик.
+
+| Гипотеза | Механизм | Проверенный эффект |
+|---|---|---|
+| **Разное зерно расчёта** | Подсчёт по событиям приёмки вместо строк заказа. 63 691 приёмка против 53 248 строк: дробление поставки создаёт несколько своевременных событий на одну опоздавшую строку | Наиболее вероятный источник основной части разрыва; величина зависит от методики второй стороны и требует подтверждения |
+| **Считается только On Time, без In Full** | Метрика называется OTIF, но фактически измеряется соблюдение срока | Доля опозданий 34–35%, то есть чистый On Time около 65% против полного OTIF 44–52% |
+| **Учёт статуса качества** | Включение `rejected` и `partially_rejected` в полученное количество | 51,93% против 45,45% — **6,5 п.п.** |
+| **Отменённые строки** | Включены в базу расчёта или исключены | 49,43% против 51,93% — **2,5 п.п.** |
+| **Часовой пояс** | `received_at_utc` сравнивается с плановой датой без приведения к MSK | 730 приёмок меняют вердикт — **1,15 п.п.** |
+| **Версия плановой даты и количества** | Последняя версия строки против версии на момент, когда поставка должна была состояться | Затрагивает 805 строк с пересмотром; на 356 строках меняет вердикт по In Full |
+| **Период атрибуции** | По плановой дате против даты приёмки | Смещает опоздавшие поставки между периодами |
+
+Три измеримых фактора вместе дают около 10 п.п. из 23 п.п. разрыва. Остаток, по всей видимости, приходится на разное зерно и на возможный расчёт только по сроку, но это подлежит подтверждению у обеих сторон, а не утверждению с нашей стороны.
+
+### Предлагаемый способ reconciliation
+
+Спор о трактовках не разрешается обсуждением — он разрешается воспроизводимым расчётом.
+
+1. **Параметризованный расчёт вместо фиксированной формулы.** Шесть переключателей из таблицы выше выносятся в конфигурацию расчёта. Метрика пересчитывается на одном согласованном периоде при каждой комбинации.
+2. **Таблица вклада.** Для каждого переключателя показывается, сколько процентных пунктов он добавляет или снимает. Разговор из «у нас 94, а у вас 71» превращается в «расхождение состоит из 6,5 п.п. на статусе качества, 2,5 п.п. на отменённых, 1,15 п.п. на часовом поясе и остатка на зерне расчёта».
+3. **Расшифровка до поставки.** По любой строке видно: плановая дата и количество (с указанием версии), все приёмки с их статусами, итоговый вердикт и сработавшее правило. Обе стороны разбирают конкретные строки, а не спорят о процентах.
+4. **Утверждение и фиксация.** Владелец метрики выбирает комбинацию, она сохраняется как `методика v1 от [дата]` и проставляется подписью в самой витрине. Хранение параметров в конфигурации означает, что последующее изменение правила — это пересчёт истории по кнопке, а не новая разработка.
+5. **Почему это снимает спор.** Обе действующие цифры перестают быть «правильной» и «неправильной»: они становятся двумя точками одной параметрической сетки, положение которых объяснено. Утверждается не победитель, а набор правил, и с этого момента цифра одна по построению.
+
+---
+
+## Проверка согласованности решения
+
+Самопроверка перед сдачей — по каждому пункту требований к качеству:
+
+| Проверка | Результат |
+|---|---|
+| Модель соответствует scope первого релиза | Да. Все девять метрик первого релиза считаются на `fact_po_line` и трёх витринах. OTIF описан, но не реализован — соответствует переносу на этап 2 |
+| Нет таблиц без бизнес-потребности | Да. 11 объектов, каждый привязан к метрике или к явно найденному дефекту. `dim_order`, `fact_receipt`, справочники договоров и прайсов сознательно отсутствуют |
+| Все связи сохраняют корректный grain | Да. Проверено по семи соединениям в разделе 2.2; связи с версиями поставщика и версиями строк разрешаются на загрузке, а не в запросе |
+| Заявленные метрики рассчитываются | Да. Для каждой указаны источник и формула; необходимые поля (`qty_base`, `price_per_base_uom_rub`, `golden_supplier_id`, `order_type`, `is_cancelled`) присутствуют в DDL |
+| Joins не приводят к двойному учёту | Да. `UNIQUE (order_id, line_no)` в факте, частичный уникальный индекс на действующую версию в ODS, отсутствие bridge-таблиц и запрет джойнов по диапазону дат в витринах |
+| Существенные дефекты данных учтены | Да. Все 10 подтверждённых дефектов имеют отражение в модели: 1 и 6 — в зерне и `is_cancelled`, 2 — в `dim_uom` и зерне витрины цен, 3 — в SCD2 и золотой записи, 4 — в `is_price_scale_suspect`, 5 — в late-arriving членах, 7 — в `ref_fx_rate_daily`, 10 — в двух колонках категории. Дефекты 8 и 9 относятся к приёмкам и обрабатываются на этапе 2 |
+| Модель расширяется без переделки | Да. `fact_receipt` подключается по `po_line_key`; плановые поля (`planned_delivery_date_key`, `qty_base`) и история версий в ODS уже есть, поскольку они нужны и первому релизу. Добавление контрактных цен из SRM — новое измерение и мера в существующем факте, без изменения зерна |
+| Ограничения не блокируют реальные данные | Да. Проверено на датасете: `qty > 0`, `price >= 0`, `factor_to_base > 0` нарушений не дают; ключ ODS уникален после схлопывания полных дублей (54 053 = число уникальных строк, конфликтов 0); `EXCLUDE` на пересечение периодов и частичный индекс на `is_current` выполняются на текущих 143 записях поставщиков |
+
+
+## 2.6. Результаты анализа качества исходных данных
 
 **Проверено файлов:** 7 (все файлы в папке [data/](data/)), суммарно **142 904 строки данных**.
 
